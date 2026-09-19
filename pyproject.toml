@@ -4,4 +4,24 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "accelerate>=1.15.0",
+    "datasets>=5.0.1",
+    "openai>=3.16.1",
+    "torch>=2.13.0",
+    "torchaudio>=2.11.0",
+    "torchvision>=0.28.0",
+    "transformers>=5.17.0",
+]
+
+# The RTX 3090 Ti driver (570.x) only speaks CUDA 12.x, so torch must come from
+# the cu129 index — PyPI's default torch wheels are built for CUDA 13.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu129" }]
+torchvision = [{ index = "pytorch-cu129" }]
+torchaudio = [{ index = "pytorch-cu129" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
