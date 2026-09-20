@@ -11,26 +11,31 @@ from vllm.distributed.weight_transfer.nccl_engine import (
 from transformers import AutoProcessor, AutoModelForMultimodalLM
 from datasets import Dataset
 from openai import AsyncOpenAI
-
 from argparse import ArgumentParser
-from collections import namedtuple
+from urllib.parse import urljoin
+
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
 
 import time
+import logging
 import requests
 import asyncio
 
 
-Sample = namedtuple('Sample', ['student_completion', 'teacher_logp'])
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def wait_for(path: str):
     while True:
         try: requests.get(path)
         except:
-            print(f"Waiting for {path}")
+            logger.info(f"Waiting for {path}")
             time.sleep(2)
         finally: 
-            print(f"READY: {path}")
+            logger.info(f"READY: {path}")
             break
 
 
@@ -46,6 +51,8 @@ def initialize_engine(model, config):
         client=HTTPVLLMWeightSyncClient(config.student_address),
         source=ModuleSource(model),
     )
+
+    return engine
 
 
 def load_dataset(*args, **kwargs):
@@ -64,7 +71,8 @@ async def rollout(
         student_client: AsyncOpenAI,
         teacher_client: AsyncOpenAI,
         config,
-) -> Sample:
+        processor
+) -> dict[str, list]:
     # we use the return_token_id's argument to avoid retokenization drift;
     # for more info, check out: 
     #    https://vllm.ai/blog/2025-10-22-agent-lightning
@@ -80,40 +88,62 @@ async def rollout(
         extra_body={"return_token_ids": True},
     ) 
 
+    prompt_ids = completion.prompt_token_ids
+
     # for each rollout above, we want to score asynchronously
     teacher_score_tasks = [
-        teacher_client.chat.completions.create(
+        teacher_client.completions.create(
             model=config.teacher_model,
-            messages=[
-                {"role": "user", "content": item},
-                {"role": "assistant", "content": choice.message.content},
-            ],
+            prompt=prompt_ids + choice.token_ids,
             max_tokens=1,
-            extra_body={"prompt_logprobs": 1},
+            extra_body={"prompt_logprobs": 0, "return_token_ids": True},
         )
         for choice in completion.choices
     ]
 
     teacher_scores = await asyncio.gather(*teacher_score_tasks)
-
-    prompt_ids = completion.prompt_token_ids
     
-    for completion, teacher_score in zip(completion.choices, teacher_scores)
-        completion_ids = completion.token_ids
-        student_logp = ...
-        teacher_logp = ...
-        mask = []
+    samples = {
+        "token_ids": [],
+        "mask": [],
+        "student_logp": [],
+        "teacher_logp": [],
+    }
+    for completion, teacher_score in zip(completion.choices, teacher_scores):
+        samples["student_logp"].append(
+            [0.]*len(prompt_ids) + [token.logprob for token in completion.logprobs.content])
+        samples["teacher_logp"].append([
+            0. if token is None else next(iter(token.values()))["logprob"]
+            for token in teacher_score.choices[0].prompt_logprobs])
+        samples["token_ids"].append(
+                prompt_ids + completion.token_ids)
+        samples["mask"].append(
+                [0,]*len(prompt_ids) + [1,]*len(completion.token_ids))
 
-    return Sample(
-        token_ids,
-        mask,
-        completion.choices[0].logprobs,
-        teacher_scores.prompt_logprobs
-    )
+    return samples
 
 
-def compute_reverse_kl(sample: Sample):
-    pass
+def compute_loss(student, sample: list[dict]):
+    input_ids = torch.tensor(sample["token_ids"], device=torch.device("cuda"), dtype=torch.int64) 
+    attention_mask = torch.tensor(torch.ones_like(input_ids), device=torch.device("cuda"), dtype=torch.int64)
+
+    logits = student(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+    ).logits[:, :-1]
+
+    student_logp = -F.cross_entropy(
+        logits.float().transpose(1, 2),
+        input_ids[:, 1:], reduction="none")
+
+    advantage = -(torch.tensor(sample["student_logp"], device=torch.device("cuda"))[:, 1:] - 
+                  torch.tensor(sample["teacher_logp"], device=torch.device("cuda"))[:, 1:])
+
+    mask = torch.tensor(sample["mask"], device=torch.device("cuda"))[:, 1:].float()
+
+    per_tok = (student_logp * advantage * mask)
+
+    return per_tok.sum() / mask.sum()
 
 
 async def train_one_step(
@@ -124,16 +154,20 @@ async def train_one_step(
     student_client,
     teacher_client,
 ):
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001)
+
     for item in batch["prompt"]:
-        sample = await rollout(item, student_client, teacher_client, config)
-        advantage = -1 * compute_reverse_kl(sample)
-        loss = -(advantage * student_logp * mask).sum() / mask.sum()
+        sample = await rollout(item, student_client, teacher_client, config, processor)
+        loss = compute_loss(model, sample)
+        print(loss)
+        optimizer.zero_grad()
         loss.backward()
+        optimizer.step()
 
 
 async def train(config):
-    wait_for(config.student_address + "/health")
-    wait_for(config.teacher_address + "/health")
+    wait_for(urljoin(config.student_address, "health"))
+    wait_for(urljoin(config.teacher_address, "/health"))
 
     processor = AutoProcessor.from_pretrained(
             config.student_model)
@@ -145,11 +179,11 @@ async def train(config):
     engine = initialize_engine(model, config)
 
     student_client = AsyncOpenAI(
-        base_url=config.student_address + "/v1",
+        base_url=urljoin(config.student_address, "v1"),
         api_key="(empty)")
     
     teacher_client = AsyncOpenAI(
-        base_url=config.teacher_address + "/v1",
+        base_url=urljoin(config.teacher_address, "v1"),
         api_key="(empty)")
     
     for step in range(config.epochs):
@@ -171,7 +205,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="test_data")
     parser.add_argument("--rollouts", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=100)
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=1)
     config = parser.parse_args()
 
