@@ -18,6 +18,8 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 
+from torch.nn.utils.rnn import pad_sequence
+
 import time
 import logging
 import requests
@@ -111,20 +113,25 @@ async def rollout(
     }
     for completion, teacher_score in zip(completion.choices, teacher_scores):
         samples["student_logp"].append(
-            [0.]*len(prompt_ids) + [token.logprob for token in completion.logprobs.content])
-        samples["teacher_logp"].append([
+            torch.tensor(
+                [0.]*len(prompt_ids) + [token.logprob for token in completion.logprobs.content],
+                device=torch.device("cuda")))
+        samples["teacher_logp"].append(
+            torch.tensor([
             0. if token is None else next(iter(token.values()))["logprob"]
-            for token in teacher_score.choices[0].prompt_logprobs])
+            for token in teacher_score.choices[0].prompt_logprobs], device=torch.device("cuda")))
         samples["token_ids"].append(
-                prompt_ids + completion.token_ids)
+                torch.tensor(
+                prompt_ids + completion.token_ids, device=torch.device("cuda"), dtype=torch.int64))
         samples["mask"].append(
-                [0,]*len(prompt_ids) + [1,]*len(completion.token_ids))
+                torch.tensor(
+                [0,]*len(prompt_ids) + [1,]*len(completion.token_ids), device=torch.device("cuda"), dtype=torch.int64))
 
     return samples
 
 
 def compute_loss(student, sample: list[dict]):
-    input_ids = torch.tensor(sample["token_ids"], device=torch.device("cuda"), dtype=torch.int64) 
+    input_ids = sample["token_ids"]
     attention_mask = torch.tensor(torch.ones_like(input_ids), device=torch.device("cuda"), dtype=torch.int64)
 
     logits = student(
@@ -136,14 +143,20 @@ def compute_loss(student, sample: list[dict]):
         logits.float().transpose(1, 2),
         input_ids[:, 1:], reduction="none")
 
-    advantage = -(torch.tensor(sample["student_logp"], device=torch.device("cuda"))[:, 1:] - 
-                  torch.tensor(sample["teacher_logp"], device=torch.device("cuda"))[:, 1:])
+    advantage = -(sample["student_logp"][:, 1:] - sample["teacher_logp"][:, 1:])
 
-    mask = torch.tensor(sample["mask"], device=torch.device("cuda"))[:, 1:].float()
+    mask = sample["mask"][:, 1:].float()
 
     per_tok = (student_logp * advantage * mask)
 
     return per_tok.sum() / mask.sum()
+
+
+def collate_fn(data: dict[str, list]):
+    return {
+        k: pad_sequence(v, batch_first=True, padding_value=0)
+        for k, v in data.items()
+    }
 
 
 async def train_one_step(
@@ -154,10 +167,11 @@ async def train_one_step(
     student_client,
     teacher_client,
 ):
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001)
+    optimizer = optim.AdamW(model.parameters(), lr=0.00001)
 
     for item in batch["prompt"]:
         sample = await rollout(item, student_client, teacher_client, config, processor)
+        sample = collate_fn(sample)
         loss = compute_loss(model, sample)
         print(loss)
         optimizer.zero_grad()
@@ -167,7 +181,7 @@ async def train_one_step(
 
 async def train(config):
     wait_for(urljoin(config.student_address, "health"))
-    wait_for(urljoin(config.teacher_address, "/health"))
+    wait_for(urljoin(config.teacher_address, "health"))
 
     processor = AutoProcessor.from_pretrained(
             config.student_model)
@@ -186,6 +200,8 @@ async def train(config):
         base_url=urljoin(config.teacher_address, "v1"),
         api_key="(empty)")
     
+    # reset the weights, so you're not using the first training run
+    engine.send_weights()
     for step in range(config.epochs):
         for batch in dataset.iter(batch_size=config.batch_size):
             await train_one_step(
