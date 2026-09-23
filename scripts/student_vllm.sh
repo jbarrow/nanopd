@@ -7,4 +7,6 @@ echo "Starting STUDENT(${STUDENT_MODEL}) on port ${STUDENT_PORT}"
 
 VLLM_SERVER_DEV_MODE=1 vllm serve ${STUDENT_MODEL} \
     --weight-transfer-config '{"backend": "nccl"}' \
-    --port ${STUDENT_PORT} 
+    --port ${STUDENT_PORT} \
+    --no-enable-prefix-caching \
+    --gpu-memory-utilization 0.8

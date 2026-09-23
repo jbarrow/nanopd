@@ -12,7 +12,13 @@ dependencies = [
     "torchaudio>=2.11.0",
     "torchvision>=0.28.0",
     "transformers>=5.17.0",
+    "wandb>=0.30.0",
 ]
+
+# vllm is installed outside of this file, and its nvidia-cutlass-dsl deps need
+# protobuf<7; without this, wandb drags protobuf up to 7.x.
+[tool.uv]
+constraint-dependencies = ["protobuf>=6.30.2,<7"]
 
 # The RTX 3090 Ti driver (570.x) only speaks CUDA 12.x, so torch must come from
 # the cu129 index — PyPI's default torch wheels are built for CUDA 13.

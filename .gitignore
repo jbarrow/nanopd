@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# wandb run logs
+wandb/
+
+# model checkpoints
+checkpoints/
